@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+import time
+import math
+import threading
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.action import ActionClient
+
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import Pose
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
+
+from moveit_msgs.srv import GetCartesianPath
+from moveit_msgs.action import ExecuteTrajectory
+from moveit_msgs.msg import RobotState
+
+from pymoveit2 import MoveIt2
+
+
+class ArmMover:
+    def __init__(self, node: Node) -> None:
+        self.node = node
+        self._got_joint_state = False
+        self._last_joint_state = None
+
+        self._js_sub = self.node.create_subscription(
+            JointState, "/joint_states", self._on_joint_state, 10
+        )
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self.node)
+
+        self.base_link = "base_link"
+        self.ee_link = "tool"   # 改成你实际的末端 link
+        self.group_name = "arm"
+
+        self.joint_names = [
+            "base_joint",
+            "shoulder_joint",
+            "elbow_joint",
+            "wrist1_joint",
+            "wrist2_joint",
+            "wrist3_joint",
+        ]
+
+        # 关节空间运动接口
+        self.moveit2 = MoveIt2(
+            node=self.node,
+            joint_names=self.joint_names,
+            base_link_name=self.base_link,
+            end_effector_name=self.ee_link,
+            group_name=self.group_name,
+            use_move_group_action=True,
+        )
+
+        # 这里把速度调高一些
+        self.moveit2.max_velocity = 3.0
+        self.moveit2.max_acceleration = 2.0
+
+        # 笛卡尔路径服务
+        self.cartesian_client = self.node.create_client(
+            GetCartesianPath,
+            "/compute_cartesian_path"
+        )
+
+        # 轨迹执行 action
+        self.execute_client = ActionClient(
+            self.node,
+            ExecuteTrajectory,
+            "/execute_trajectory"
+        )
+
+    def _on_joint_state(self, msg: JointState):
+        self._got_joint_state = True
+        self._last_joint_state = msg
+
+    def wait_joint_states(self, timeout_sec=10.0) -> bool:
+        t0 = time.time()
+        while rclpy.ok() and (time.time() - t0) < timeout_sec:
+            if self._got_joint_state and self._last_joint_state is not None:
+                self.node.get_logger().info("Joint states are available.")
+                return True
+            time.sleep(0.05)
+        self.node.get_logger().error("Timeout waiting for /joint_states.")
+        return False
+
+    def wait_move_action(self, timeout_sec=10.0) -> bool:
+        t0 = time.time()
+        cli = getattr(self.moveit2, "_MoveIt2__move_action_client", None)
+        if cli is None:
+            self.node.get_logger().error("MoveIt2 action client not found.")
+            return False
+
+        while rclpy.ok() and (time.time() - t0) < timeout_sec:
+            if cli.server_is_ready():
+                self.node.get_logger().info("move_action server is ready.")
+                return True
+            time.sleep(0.1)
+
+        self.node.get_logger().error("Timeout waiting for move_action server.")
+        return False
+
+    def wait_cartesian_service(self, timeout_sec=10.0) -> bool:
+        ok = self.cartesian_client.wait_for_service(timeout_sec=timeout_sec)
+        if ok:
+            self.node.get_logger().info("compute_cartesian_path service is ready.")
+        else:
+            self.node.get_logger().error("Timeout waiting for /compute_cartesian_path.")
+        return ok
+
+    def wait_execute_action(self, timeout_sec=10.0) -> bool:
+        ok = self.execute_client.wait_for_server(timeout_sec=timeout_sec)
+        if ok:
+            self.node.get_logger().info("execute_trajectory action is ready.")
+        else:
+            self.node.get_logger().error("Timeout waiting for /execute_trajectory.")
+        return ok
+
+    def get_current_pose(self, timeout_sec=3.0):
+        t0 = time.time()
+        while rclpy.ok() and (time.time() - t0) < timeout_sec:
+            try:
+                trans = self.tf_buffer.lookup_transform(
+                    self.base_link,
+                    self.ee_link,
+                    rclpy.time.Time()
+                )
+                p = trans.transform.translation
+                q = trans.transform.rotation
+                position = [p.x, p.y, p.z]
+                quat_xyzw = [q.x, q.y, q.z, q.w]
+                return position, quat_xyzw
+            except (LookupException, ConnectivityException, ExtrapolationException):
+                time.sleep(0.05)
+
+        raise RuntimeError(f"Cannot get current pose from {self.base_link} to {self.ee_link}")
+
+    def move_to_configuration(self, joint_positions) -> bool:
+        self.node.get_logger().info(f"Move to joint configuration: {joint_positions}")
+        try:
+            self.moveit2.move_to_configuration(joint_positions)
+            result = self.moveit2.wait_until_executed()
+            if result is False:
+                self.node.get_logger().error("Joint motion execution failed.")
+                return False
+            return True
+        except Exception as e:
+            self.node.get_logger().error(f"move_to_configuration exception: {repr(e)}")
+            return False
+
+    def _build_start_state(self) -> RobotState:
+        if self._last_joint_state is None:
+            raise RuntimeError("No joint state available.")
+        rs = RobotState()
+        rs.joint_state = self._last_joint_state
+        return rs
+
+    def compute_cartesian_path(
+        self,
+        waypoints,
+        max_step=0.01,
+        jump_threshold=0.0,
+        avoid_collisions=True,
+    ):
+        req = GetCartesianPath.Request()
+        req.header.frame_id = self.base_link
+        req.header.stamp = self.node.get_clock().now().to_msg()
+        req.start_state = self._build_start_state()
+        req.group_name = self.group_name
+        req.link_name = self.ee_link
+        req.waypoints = waypoints
+        req.max_step = max_step
+        req.jump_threshold = jump_threshold
+        req.avoid_collisions = avoid_collisions
+
+        # 某些版本有这两个字段，某些没有
+        if hasattr(req, "prismatic_jump_threshold"):
+            req.prismatic_jump_threshold = 0.0
+        if hasattr(req, "revolute_jump_threshold"):
+            req.revolute_jump_threshold = 0.0
+
+        future = self.cartesian_client.call_async(req)
+        rclpy.spin_until_future_complete(self.node, future)
+
+        result = future.result()
+        if result is None:
+            raise RuntimeError("compute_cartesian_path returned None")
+        return result
+
+    def execute_trajectory(self, trajectory) -> bool:
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = trajectory
+
+        send_goal_future = self.execute_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self.node, send_goal_future)
+        goal_handle = send_goal_future.result()
+
+        if goal_handle is None:
+            self.node.get_logger().error("Failed to send execute_trajectory goal.")
+            return False
+        if not goal_handle.accepted:
+            self.node.get_logger().error("execute_trajectory goal rejected.")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self.node, result_future)
+        result = result_future.result()
+
+        if result is None:
+            self.node.get_logger().error("execute_trajectory returned None.")
+            return False
+
+        # GoalStatus.STATUS_SUCCEEDED = 4
+        if result.status != 4:
+            self.node.get_logger().error(f"execute_trajectory failed, status={result.status}")
+            return False
+
+        return True
+
+    def make_pose(self, xyz, quat_xyzw):
+        pose = Pose()
+        pose.position.x = float(xyz[0])
+        pose.position.y = float(xyz[1])
+        pose.position.z = float(xyz[2])
+        pose.orientation.x = float(quat_xyzw[0])
+        pose.orientation.y = float(quat_xyzw[1])
+        pose.orientation.z = float(quat_xyzw[2])
+        pose.orientation.w = float(quat_xyzw[3])
+        return pose
+
+    def build_snake_points_yz(self, base_pos, row_length=0.5, row_step=0.08, num_rows=7):
+        """
+        在 base_link 坐标系下做 y-z 平面蛇形，x 保持不变。
+        从当前点开始：
+        第1行 y 负方向扫
+        上移一行
+        第2行 y 正方向扫
+        上移一行
+        ...
+        """
+        x0, y0, z0 = base_pos
+        pts = [[x0, y0, z0]]
+
+        current_y = y0
+        current_z = z0
+        direction = -1.0  # 第一行先往 y 负方向
+
+        for row in range(num_rows):
+            target_y = current_y + direction * row_length
+            pts.append([x0, target_y, current_z])
+
+            if row != num_rows - 1:
+                current_y = target_y
+                current_z = current_z + row_step
+                pts.append([x0, current_y, current_z])
+
+            direction *= -1.0
+
+        return pts
+
+    def execute_cartesian_segment_once(
+        self,
+        p_start,
+        p_goal,
+        quat_xyzw,
+        max_step=0.01,
+        avoid_collisions=True,
+    ) -> bool:
+        """
+        单段笛卡尔执行，只尝试一次，不做二分。
+        """
+        waypoints = [
+            self.make_pose(p_start, quat_xyzw),
+            self.make_pose(p_goal, quat_xyzw),
+        ]
+
+        result = self.compute_cartesian_path(
+            waypoints=waypoints,
+            max_step=max_step,
+            jump_threshold=0.0,
+            avoid_collisions=avoid_collisions,
+        )
+
+        self.node.get_logger().info(
+            f"[segment once] {p_start} -> {p_goal}, "
+            f"fraction = {result.fraction:.4f}, error_code = {result.error_code.val}"
+        )
+
+        if result.fraction < 0.999:
+            self.node.get_logger().error("This segment cannot be solved completely.")
+            return False
+
+        return self.execute_trajectory(result.solution)
+
+    def execute_cartesian_polyline(self, points_xyz, quat_xyzw, max_step=0.01):
+        """
+        先整条算；如果 fraction 不够，再逐段算并执行。
+        不再进行递归二分。
+        """
+        # 1) 整条尝试
+        whole_waypoints = [self.make_pose(p, quat_xyzw) for p in points_xyz]
+        result = self.compute_cartesian_path(
+            waypoints=whole_waypoints,
+            max_step=max_step,
+            jump_threshold=0.0,
+            avoid_collisions=True,
+        )
+
+        self.node.get_logger().info(
+            f"[whole] fraction = {result.fraction:.4f}, error_code = {result.error_code.val}"
+        )
+
+        if result.fraction > 0.999:
+            self.node.get_logger().info("Whole snake path solved. Executing.")
+            return self.execute_trajectory(result.solution)
+
+        # 2) 整条失败，退化为逐段执行，但不做二分
+        self.node.get_logger().warn(
+            "Whole path incomplete. Fallback to segment-by-segment Cartesian execution."
+        )
+
+        for i in range(len(points_xyz) - 1):
+            p_start = points_xyz[i]
+            p_goal = points_xyz[i + 1]
+
+            self.node.get_logger().info(
+                f"[segment {i+1}/{len(points_xyz)-1}] start={p_start}, goal={p_goal}"
+            )
+
+            ok = self.execute_cartesian_segment_once(
+                p_start=p_start,
+                p_goal=p_goal,
+                quat_xyzw=quat_xyzw,
+                max_step=max_step,
+                avoid_collisions=True,
+            )
+            if not ok:
+                self.node.get_logger().error(f"Segment {i+1} execution failed.")
+                return False
+
+        return True
+
+
+def main():
+    rclpy.init()
+    node = Node("arm_cartesian_snake")
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+    try:
+        mover = ArmMover(node)
+
+        if not mover.wait_joint_states(timeout_sec=15.0):
+            return
+        if not mover.wait_move_action(timeout_sec=15.0):
+            return
+        if not mover.wait_cartesian_service(timeout_sec=15.0):
+            return
+        if not mover.wait_execute_action(timeout_sec=15.0):
+            return
+
+        # 第一步：关节空间到初始位置
+        ready_joints = [
+            math.radians(90),
+            math.radians(-112),
+            math.radians(19),
+            math.radians(97),
+            math.radians(-87),
+            math.radians(90),
+        ]
+
+        if not mover.move_to_configuration(ready_joints):
+            node.get_logger().error("Failed to move to ready joint configuration.")
+            return
+
+        # 第二步：读取当前末端位姿，固定当前姿态
+        current_pos, current_quat = mover.get_current_pose()
+        node.get_logger().info(f"Current position: {current_pos}")
+        node.get_logger().info(f"Current quat_xyzw: {current_quat}")
+
+        # 第三步：构造蛇形折线（Y-Z平面）
+        snake_points = mover.build_snake_points_yz(
+            base_pos=current_pos,
+            row_length=0.5,   # 每行长度
+            row_step=0.08,    # 行间距
+            num_rows=7,
+        )
+        node.get_logger().info(f"Snake polyline points: {snake_points}")
+
+        # 第四步：执行蛇形笛卡尔路径
+        ok = mover.execute_cartesian_polyline(
+            points_xyz=snake_points,
+            quat_xyzw=current_quat,
+            max_step=0.01,    # 比 0.003 更快
+        )
+
+        if not ok:
+            node.get_logger().error("Snake Cartesian execution failed.")
+            return
+
+        node.get_logger().info("Snake path completed successfully!")
+
+        # 第五步：回到初始关节位置
+        node.get_logger().info("Returning to initial joint configuration...")
+        if not mover.move_to_configuration(ready_joints):
+            node.get_logger().error("Failed to return to initial joint configuration.")
+            return
+
+        node.get_logger().info("Successfully returned to initial joint configuration!")
+
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

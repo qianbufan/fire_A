@@ -6,12 +6,12 @@ Ubuntu22.04 ROS2 Humble MoveIt2
 ## 功能包简介
 arm_moveit_config：主程序运行功能包，由MoveIt2 assistant生成  
 robot：机器人模型和基础配置    
-pymoveit2：moveit2对python接口
+pymoveit2：moveit2对python接口，需先安装
 
 ## 使用方法
 1. 加载环境变量  
 cd 工作空间 #进入  
-colcon build #构建，失败了看报错缺什么包就装什么  
+colcon build #构建
 source install/setup.bash #加载环境变量  
 chmod +x src/arm_moveit_config/scripts/*.py #给python脚本执行权限  
 2. 启动机器人  

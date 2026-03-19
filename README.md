@@ -23,3 +23,4 @@ ros2 launch arm_moveit_config demo.launch.py
 4. 开始移动  
 在另一个终端中：python src/arm_moveit_config/scripts/move.py  
 #可以在Rviz中看到机器人的运动  
+<img width="1751" height="1235" alt="image" src="https://github.com/user-attachments/assets/980a6065-8c2d-4dda-afef-6053b62a7def" />

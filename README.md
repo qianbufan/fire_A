@@ -11,7 +11,7 @@ pymoveit2：moveit2对python接口，需先安装
 ## 使用方法
 1. 加载环境变量  
 cd 工作空间 #进入  
-colcon build #构建
+colcon build #构建  
 source install/setup.bash #加载环境变量  
 chmod +x src/arm_moveit_config/scripts/*.py #给python脚本执行权限  
 2. 启动机器人  

@@ -130,7 +130,7 @@
       lower="-3"
       upper="3"
       effort="200"
-      velocity="5" />
+      velocity="25" />
   </joint>
   <link
     name="shoulder_link">
@@ -188,7 +188,7 @@
       lower="-3"
       upper="3"
       effort="200"
-      velocity="5" />
+      velocity="25" />
   </joint>
   <link
     name="elbow_link">
@@ -246,7 +246,7 @@
       lower="-3"
       upper="3"
       effort="200"
-      velocity="5" />
+      velocity="25" />
   </joint>
   <link
     name="wrist1_link">
@@ -304,7 +304,7 @@
       lower="-3"
       upper="3"
       effort="200"
-      velocity="5" />
+      velocity="25" />
   </joint>
   <link
     name="wrist2_link">
@@ -362,7 +362,7 @@
       lower="-3"
       upper="3"
       effort="200"
-      velocity="5" />
+      velocity="25" />
   </joint>
   <link
     name="wrist3_link">
@@ -420,7 +420,7 @@
       lower="-3"
       upper="3"
       effort="200"
-      velocity="5" />
+      velocity="25" />
   </joint>
   <link
     name="tool">
